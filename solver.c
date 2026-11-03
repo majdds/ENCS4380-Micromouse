@@ -1,5 +1,5 @@
 /*
- * solver.c - Team T?? - robot name: ????
+ * solver.c - Team T30 - robot name: Fathi
  *
  * Your maze solver. This file must:
  *   - include only mouse_hal.h and standard C headers (no simulator API,
@@ -13,7 +13,7 @@
 
 void solver_run(void)
 {
-    mm_begin("T00");                       /* TODO: your team ID, e.g. "T07" */
+    mm_begin("T30");
 
     mm_maze_t maze = mm_maze();
     mm_log("solver started: maze %dx%d", maze.width, maze.height);
