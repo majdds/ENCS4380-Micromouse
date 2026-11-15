@@ -228,11 +228,14 @@ static void report_map(void)
     mm_map_end();
 }
 
-/* BFS-focused training run: map walls and travel to the goal once.
-   This deliberately excludes return-home and speed-run phases. */
+/* Second M1 card: first discover a route to the goal, then navigate home,
+   then follow only verified open edges for a final goal-directed run.
+   This final run is a confirmed shortest-cell-count path, not necessarily
+   the fastest physical run because it uses ordinary movement commands. */
 void solver_run(void)
 {
-    mm_begin("T30 BFS");
+    unsigned long exploration_end, home_end, final_end;
+    mm_begin("T30 M1 Navigation");
     maze = mm_maze();
     if (maze.width < 1 || maze.height < 1 ||
         maze.width > MM_MAX_SIZE || maze.height > MM_MAX_SIZE) {
@@ -240,13 +243,41 @@ void solver_run(void)
         return;
     }
     initialize_map();
-    mm_log("BFS flood-fill demonstration: %dx%d maze", maze.width, maze.height);
-    if (navigate(1, 0)) {
-        mm_mark(px, py, MM_COLOR_GREEN);
-        mm_log("BFS goal reached at (%d,%d), t=%lu ms",
-               px, py, (unsigned long)mm_millis());
-    } else {
-        mm_log("BFS navigation ended without reaching goal");
+
+    mm_log("PHASE 1: EXPLORE TO GOAL, %dx%d maze", maze.width, maze.height);
+    if (!navigate(1, 0)) {
+        mm_log("FAIL: goal was not reached during exploration");
+        goto finish;
     }
+    exploration_end = (unsigned long)mm_millis();
+    mm_log("PHASE 1 COMPLETE: goal reached at (%d,%d), t=%lu ms",
+           px, py, exploration_end);
+
+    mm_log("PHASE 2: RETURN HOME");
+    if (!navigate(0, 0)) {
+        mm_log("FAIL: could not return to start");
+        goto finish;
+    }
+    home_end = (unsigned long)mm_millis();
+    mm_log("PHASE 2 COMPLETE: returned home at (%d,%d), t=%lu ms",
+           px, py, home_end);
+
+    /* Flood only over edges that were actually confirmed open. */
+    flood(1, 1, 1);
+    if (dist[0][0] == INF) {
+        mm_log("FAIL: no fully confirmed route from home to goal");
+        goto finish;
+    }
+    mm_log("PHASE 3: CONFIRMED PATH RUN, shortest path=%d cells", dist[0][0]);
+    if (!navigate(1, 1)) {
+        mm_log("FAIL: confirmed path run did not reach goal");
+        goto finish;
+    }
+    final_end = (unsigned long)mm_millis();
+    mm_mark(px, py, MM_COLOR_GREEN);
+    mm_log("PHASE 3 COMPLETE: goal reached at (%d,%d), t=%lu ms, final-run elapsed=%lu ms",
+           px, py, final_end, final_end - home_end);
+    mm_log("M1 navigation sequence COMPLETE");
+finish:
     report_map();
 }
