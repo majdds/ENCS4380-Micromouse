@@ -2,6 +2,7 @@
 #include "mouse_hal.h"
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 #define CAP (MM_MAX_SIZE * MM_MAX_SIZE)
 #define INF 10000
@@ -12,6 +13,7 @@ static uint8_t known[MM_MAX_SIZE][MM_MAX_SIZE];
 static unsigned short visits[MM_MAX_SIZE][MM_MAX_SIZE];
 static int dist[MM_MAX_SIZE][MM_MAX_SIZE];
 static int px, py, heading;
+static unsigned int blocked_moves, motion_faults, map_conflicts;
 static const int dx[4] = {0, 1, 0, -1};
 static const int dy[4] = {1, 0, -1, 0};
 
@@ -29,8 +31,25 @@ static int goal_cell(int x, int y)
 /* Set both sides of a shared boundary, when the neighbor exists. */
 static void observe(int x, int y, int d, int is_wall)
 {
-    int nx = x + dx[d], ny = y + dy[d];
-    uint8_t b = MM_WALL(d);
+    int nx, ny;
+    uint8_t b;
+    if (!inside(x, y) || d < MM_NORTH || d > MM_WEST) {
+        mm_log("ERROR: invalid wall observation (%d,%d) dir=%d", x, y, d);
+        ++map_conflicts;
+        return;
+    }
+    nx = x + dx[d]; ny = y + dy[d];
+    b = MM_WALL(d);
+    /* The maze perimeter is always a wall, regardless of a bad reading. */
+    if (!inside(nx, ny) && !is_wall) {
+        ++map_conflicts;
+        mm_log("WARNING: sensor reports an open maze boundary at (%d,%d) dir=%d", x, y, d);
+        is_wall = 1;
+    }
+    if ((known[y][x] & b) && !!(walls[y][x] & b) != !!is_wall) {
+        ++map_conflicts;
+        mm_log("WARNING: changed wall reading at (%d,%d) dir=%d", x, y, d);
+    }
     known[y][x] |= b;
     if (is_wall) {
         walls[y][x] |= b;
@@ -78,10 +97,16 @@ static void read_walls(void)
 /* True for a traversable edge. In explore mode, unknown means possible. */
 static int passage(int x, int y, int d, int confirmed_only)
 {
-    int nx = x + dx[d], ny = y + dy[d];
-    uint8_t bit = MM_WALL(d);
-    if (!inside(nx, ny) || (walls[y][x] & bit)) return 0;
-    if (confirmed_only && !(known[y][x] & bit)) return 0;
+    int nx, ny;
+    uint8_t bit, reverse_bit;
+    if (!inside(x, y) || d < MM_NORTH || d > MM_WEST) return 0;
+    nx = x + dx[d]; ny = y + dy[d];
+    bit = MM_WALL(d);
+    reverse_bit = MM_WALL((d + 2) % 4);
+    if (!inside(nx, ny)) return 0;
+    if ((walls[y][x] & bit) || (walls[ny][nx] & reverse_bit)) return 0;
+    if (confirmed_only && (!(known[y][x] & bit) ||
+                           !(known[ny][nx] & reverse_bit))) return 0;
     return 1;
 }
 
@@ -98,6 +123,7 @@ static void flood(int to_goal, int confirmed_only, int show_labels)
         for (x = 0; x < maze.width; ++x) {
             if ((to_goal && goal_cell(x, y)) || (!to_goal && x == 0 && y == 0)) {
                 dist[y][x] = 0;
+                if (tail >= CAP) { mm_log("ERROR: BFS source queue overflow"); return; }
                 qx[tail] = x; qy[tail++] = y;
             }
         }
@@ -110,6 +136,7 @@ static void flood(int to_goal, int confirmed_only, int show_labels)
             if (!passage(x, y, d, confirmed_only)) continue;
             if (dist[ny][nx] != INF) continue;
             dist[ny][nx] = dist[y][x] + 1;
+            if (tail >= CAP) { mm_log("ERROR: BFS queue overflow"); return; }
             qx[tail] = nx; qy[tail++] = ny;
         }
     }
@@ -140,17 +167,29 @@ static int rotate_to(int d)
 static int advance(int d)
 {
     mm_status_t r;
-    if (!rotate_to(d)) return -1;
+    int nx, ny;
+    if (!inside(px, py) || d < MM_NORTH || d > MM_WEST ||
+        !passage(px, py, d, 0)) {
+        ++motion_faults;
+        mm_log("ERROR: rejected unsafe movement at (%d,%d) dir=%d", px, py, d);
+        return -1;
+    }
+    nx = px + dx[d]; ny = py + dy[d];
+    if (!rotate_to(d)) { ++motion_faults; return -1; }
     r = mm_forward(1);
     if (r == MM_BLOCKED) {
+        ++blocked_moves;
         observe(px, py, d, 1);
         mm_log("unexpected wall at (%d,%d) dir=%d", px, py, d);
         return 0;
     }
-    if (r != MM_OK) return -1;
-    px += dx[d];
-    py += dy[d];
-    if (!inside(px, py)) return -1;
+    if (r != MM_OK) {
+        ++motion_faults;
+        mm_log("ERROR: forward command fault at (%d,%d) dir=%d", px, py, d);
+        return -1;
+    }
+    px = nx;
+    py = ny;
     return 1;
 }
 
@@ -196,6 +235,11 @@ static int navigate(int to_goal, int confirmed_only)
     for (step = 0; step < limit; ++step) {
         int d, r;
         reset_if_requested();
+        if (!inside(px, py)) {
+            ++motion_faults;
+            mm_log("ERROR: position outside maze (%d,%d)", px, py);
+            return 0;
+        }
         read_walls();
         if (to_goal ? goal_cell(px, py) : (px == 0 && py == 0)) return 1;
         flood(to_goal, confirmed_only, 1);
@@ -220,11 +264,34 @@ static int navigate(int to_goal, int confirmed_only)
 
 static void report_map(void)
 {
-    int x, y;
+    int x, y, d, observed = 0, unknown = 0, mismatches = 0;
+    for (y = 0; y < maze.height; ++y) {
+        for (x = 0; x < maze.width; ++x) {
+            for (d = 0; d < 4; ++d) {
+                int nx = x + dx[d], ny = y + dy[d];
+                uint8_t bit = MM_WALL(d);
+                if (known[y][x] & bit) ++observed;
+                else ++unknown;
+                if (!inside(nx, ny)) {
+                    if (!(known[y][x] & bit) || !(walls[y][x] & bit)) ++mismatches;
+                } else {
+                    uint8_t opposite = MM_WALL((d + 2) % 4);
+                    if (!!(known[y][x] & bit) != !!(known[ny][nx] & opposite) ||
+                        ((known[y][x] & bit) &&
+                         (!!(walls[y][x] & bit) != !!(walls[ny][nx] & opposite))))
+                        ++mismatches;
+                }
+            }
+        }
+    }
+    mm_log("MAP CHECK: %d observed sides, %d unknown sides, %d asymmetric/boundary issues",
+           observed, unknown, mismatches);
+    mm_log("SAFETY CHECK: blocked moves=%u, motion faults=%u, changed/bad readings=%u",
+           blocked_moves, motion_faults, map_conflicts);
     mm_map_begin();
     for (y = 0; y < maze.height; ++y)
         for (x = 0; x < maze.width; ++x)
-            mm_map_cell(x, y, walls[y][x], known[y][x]);
+            mm_map_cell(x, y, (uint8_t)(walls[y][x] & known[y][x]), known[y][x]);
     mm_map_end();
 }
 
@@ -238,10 +305,14 @@ void solver_run(void)
     mm_begin("T30 M1 Navigation");
     maze = mm_maze();
     if (maze.width < 1 || maze.height < 1 ||
-        maze.width > MM_MAX_SIZE || maze.height > MM_MAX_SIZE) {
+        maze.width > MM_MAX_SIZE || maze.height > MM_MAX_SIZE ||
+        maze.goal_x0 < 0 || maze.goal_y0 < 0 ||
+        maze.goal_x1 < maze.goal_x0 || maze.goal_y1 < maze.goal_y0 ||
+        maze.goal_x1 >= maze.width || maze.goal_y1 >= maze.height) {
         mm_log("unsupported maze size");
         return;
     }
+    blocked_moves = motion_faults = map_conflicts = 0;
     initialize_map();
 
     mm_log("PHASE 1: EXPLORE TO GOAL, %dx%d maze", maze.width, maze.height);
